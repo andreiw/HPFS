@@ -1,11 +1,13 @@
 /*
-  FUSE: Filesystem in Userspace
-  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+  Host Profile Overlay FS
+  Copyright (C) 2011 Andrei Warkentin <andreiw@vmware.com>
 
   This program can be distributed under the terms of the GNU GPL.
   See the file COPYING.
 
-  gcc -Wall `pkg-config fuse --cflags --libs` -lulockmgr fusexmp_fh.c -o fusexmp_fh
+  gcc -Wall `pkg-config fuse --cflags --libs` -lulockmgr hpfs.c -o hpfs
+
+  Using: ./hpfs -o allow_root ~/ -o nonempty
 */
 
 #define FUSE_USE_VERSION 26
@@ -30,18 +32,40 @@
 #include <sys/xattr.h>
 #endif
 
-static int xmp_getattr(const char *path, struct stat *stbuf)
+#include <dirent.h>
+#include <sys/types.h>
+#include <pwd.h>
+
+struct hp_priv {
+	int fd;
+};
+
+static int saved_home_fd = -1;
+
+static int hp_getattr(const char *path, struct stat *stbuf)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = lstat(path, stbuf);
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	res = fstatat(priv->fd,
+		      path, stbuf, AT_SYMLINK_NOFOLLOW);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_fgetattr(const char *path, struct stat *stbuf,
+static int hp_fgetattr(const char *path, struct stat *stbuf,
 			struct fuse_file_info *fi)
 {
 	int res;
@@ -55,22 +79,44 @@ static int xmp_fgetattr(const char *path, struct stat *stbuf,
 	return 0;
 }
 
-static int xmp_access(const char *path, int mask)
+static int hp_access(const char *path, int mask)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = access(path, mask);
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	res = faccessat(priv->fd, path, mask, 0);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_readlink(const char *path, char *buf, size_t size)
+static int hp_readlink(const char *path, char *buf, size_t size)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = readlink(path, buf, size - 1);
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	res = readlinkat(priv->fd, path, buf, size - 1);
 	if (res == -1)
 		return -errno;
 
@@ -78,22 +124,43 @@ static int xmp_readlink(const char *path, char *buf, size_t size)
 	return 0;
 }
 
-struct xmp_dirp {
+struct hp_dirp {
 	DIR *dp;
 	struct dirent *entry;
 	off_t offset;
 };
 
-static int xmp_opendir(const char *path, struct fuse_file_info *fi)
+static int hp_opendir(const char *path, struct fuse_file_info *fi)
 {
 	int res;
-	struct xmp_dirp *d = malloc(sizeof(struct xmp_dirp));
+	int fd;
+	struct hp_dirp *d = malloc(sizeof(struct hp_dirp));
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
+
+	if (!priv)
+		return -ENXIO;
+
 	if (d == NULL)
 		return -ENOMEM;
 
-	d->dp = opendir(path);
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+	
+	fd = openat(priv->fd, path, O_RDONLY | O_DIRECTORY);
+	if (fd == -1) {
+		res = -errno;
+		free(d);
+		return res;
+	}
+
+	d->dp = fdopendir(fd);
 	if (d->dp == NULL) {
 		res = -errno;
+		close(fd);
 		free(d);
 		return res;
 	}
@@ -104,15 +171,15 @@ static int xmp_opendir(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-static inline struct xmp_dirp *get_dirp(struct fuse_file_info *fi)
+static inline struct hp_dirp *get_dirp(struct fuse_file_info *fi)
 {
-	return (struct xmp_dirp *) (uintptr_t) fi->fh;
+	return (struct hp_dirp *) (uintptr_t) fi->fh;
 }
 
-static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+static int hp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		       off_t offset, struct fuse_file_info *fi)
 {
-	struct xmp_dirp *d = get_dirp(fi);
+	struct hp_dirp *d = get_dirp(fi);
 
 	(void) path;
 	if (offset != d->offset) {
@@ -144,129 +211,294 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 	return 0;
 }
 
-static int xmp_releasedir(const char *path, struct fuse_file_info *fi)
+static int hp_releasedir(const char *path, struct fuse_file_info *fi)
 {
-	struct xmp_dirp *d = get_dirp(fi);
+	int fd;
+	struct hp_dirp *d = get_dirp(fi);
 	(void) path;
+
+	fd = dirfd(d->dp);
 	closedir(d->dp);
+	close(fd);
 	free(d);
 	return 0;
 }
 
-static int xmp_mknod(const char *path, mode_t mode, dev_t rdev)
+static void *hp_init(struct fuse_conn_info *conn)
+{
+	struct hp_priv *priv;
+
+	priv = malloc(sizeof(*priv));
+	if (!priv)
+		return NULL;
+
+	priv->fd = saved_home_fd;
+	return priv;
+}
+
+static void hp_destroy(void *data)
+{
+	struct hp_priv *priv = data;
+	if (!priv)
+		return;
+
+	free(priv);
+}
+
+static int hp_mknod(const char *path, mode_t mode, dev_t rdev)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
+
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
 
 	if (S_ISFIFO(mode))
-		res = mkfifo(path, mode);
+		res = mkfifoat(priv->fd, path, mode);
 	else
-		res = mknod(path, mode, rdev);
+		res = mknodat(priv->fd, path, mode, rdev);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_mkdir(const char *path, mode_t mode)
+static int hp_mkdir(const char *path, mode_t mode)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = mkdir(path, mode);
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	res = mkdirat(priv->fd, path, mode);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_unlink(const char *path)
+static int hp_unlink(const char *path)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = unlink(path);
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	res = unlinkat(priv->fd, path, 0);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_rmdir(const char *path)
+static int hp_rmdir(const char *path)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = rmdir(path);
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	res = unlinkat(priv->fd, path, AT_REMOVEDIR);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_symlink(const char *from, const char *to)
+static int hp_symlink(const char *from, const char *to)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = symlink(from, to);
+	if (!priv)
+		return -ENXIO;
+
+	if (*from == '/')
+		from++;
+
+	if (!*from)
+		from = ".";
+
+	if (*to == '/')
+		to++;
+
+	if (!*to)
+		to = ".";
+
+	res = symlinkat(from, priv->fd, to);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_rename(const char *from, const char *to)
+static int hp_rename(const char *from, const char *to)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = rename(from, to);
+	if (!priv)
+		return -ENXIO;
+
+	if (*from == '/')
+		from++;
+
+	if (!*from)
+		from = ".";
+
+	if (*to == '/')
+		to++;
+
+	if (!*to)
+		to = ".";
+
+	res = renameat(priv->fd, from,
+		       priv->fd, to);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_link(const char *from, const char *to)
+static int hp_link(const char *from, const char *to)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = link(from, to);
+	if (!priv)
+		return -ENXIO;
+
+	if (*from == '/')
+		from++;
+
+	if (!*from)
+		from = ".";
+
+	if (*to == '/')
+		to++;
+
+	if (!*to)
+		to = ".";
+
+	res = linkat(priv->fd, from,
+		     priv->fd, to, 0);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_chmod(const char *path, mode_t mode)
+static int hp_chmod(const char *path, mode_t mode)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = chmod(path, mode);
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	res = fchmodat(priv->fd, path, mode, 0);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_chown(const char *path, uid_t uid, gid_t gid)
+static int hp_chown(const char *path, uid_t uid, gid_t gid)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = lchown(path, uid, gid);
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	res = fchownat(priv->fd, path, uid, gid, AT_SYMLINK_NOFOLLOW);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_truncate(const char *path, off_t size)
+static int hp_truncate(const char *path, off_t size)
 {
 	int res;
+	int fd;
 
-	res = truncate(path, size);
-	if (res == -1)
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
+
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	fd = openat(priv->fd, path, O_WRONLY);
+	if (fd == -1)
 		return -errno;
 
+	res = ftruncate(fd, size);
+	if (res == -1) {
+		res = -errno;
+		close(fd);
+		return res;
+	}
+
+	close(fd);
 	return 0;
 }
 
-static int xmp_ftruncate(const char *path, off_t size,
+static int hp_ftruncate(const char *path, off_t size,
 			 struct fuse_file_info *fi)
 {
 	int res;
@@ -280,28 +512,44 @@ static int xmp_ftruncate(const char *path, off_t size,
 	return 0;
 }
 
-static int xmp_utimens(const char *path, const struct timespec ts[2])
+static int hp_utimens(const char *path, const struct timespec ts[2])
 {
 	int res;
-	struct timeval tv[2];
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	tv[0].tv_sec = ts[0].tv_sec;
-	tv[0].tv_usec = ts[0].tv_nsec / 1000;
-	tv[1].tv_sec = ts[1].tv_sec;
-	tv[1].tv_usec = ts[1].tv_nsec / 1000;
+	if (!priv)
+		return -ENXIO;
 
-	res = utimes(path, tv);
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	res = utimensat(priv->fd, path, ts, 0);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+static int hp_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
 	int fd;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	fd = open(path, fi->flags, mode);
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	fd = openat(priv->fd, path, fi->flags, mode);
 	if (fd == -1)
 		return -errno;
 
@@ -309,11 +557,22 @@ static int xmp_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 	return 0;
 }
 
-static int xmp_open(const char *path, struct fuse_file_info *fi)
+static int hp_open(const char *path, struct fuse_file_info *fi)
 {
 	int fd;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	fd = open(path, fi->flags);
+	if (!priv)
+		return -ENXIO;
+
+	if (*path == '/')
+		path++;
+
+	if (!*path)
+		path = ".";
+
+	fd = openat(priv->fd, path, fi->flags);
 	if (fd == -1)
 		return -errno;
 
@@ -321,7 +580,7 @@ static int xmp_open(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
+static int hp_read(const char *path, char *buf, size_t size, off_t offset,
 		    struct fuse_file_info *fi)
 {
 	int res;
@@ -334,7 +593,7 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
 	return res;
 }
 
-static int xmp_write(const char *path, const char *buf, size_t size,
+static int hp_write(const char *path, const char *buf, size_t size,
 		     off_t offset, struct fuse_file_info *fi)
 {
 	int res;
@@ -347,18 +606,23 @@ static int xmp_write(const char *path, const char *buf, size_t size,
 	return res;
 }
 
-static int xmp_statfs(const char *path, struct statvfs *stbuf)
+static int hp_statfs(const char *path, struct statvfs *stbuf)
 {
 	int res;
+	struct fuse_context *context = fuse_get_context();
+	struct hp_priv *priv = context->private_data;
 
-	res = statvfs(path, stbuf);
+	if (!priv)
+		return -ENXIO;
+
+	res = fstatvfs(priv->fd, stbuf);
 	if (res == -1)
 		return -errno;
 
 	return 0;
 }
 
-static int xmp_flush(const char *path, struct fuse_file_info *fi)
+static int hp_flush(const char *path, struct fuse_file_info *fi)
 {
 	int res;
 
@@ -375,7 +639,7 @@ static int xmp_flush(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-static int xmp_release(const char *path, struct fuse_file_info *fi)
+static int hp_release(const char *path, struct fuse_file_info *fi)
 {
 	(void) path;
 	close(fi->fh);
@@ -383,7 +647,7 @@ static int xmp_release(const char *path, struct fuse_file_info *fi)
 	return 0;
 }
 
-static int xmp_fsync(const char *path, int isdatasync,
+static int hp_fsync(const char *path, int isdatasync,
 		     struct fuse_file_info *fi)
 {
 	int res;
@@ -403,9 +667,10 @@ static int xmp_fsync(const char *path, int isdatasync,
 	return 0;
 }
 
+#if 0
 #ifdef HAVE_SETXATTR
 /* xattr operations are optional and can safely be left unimplemented */
-static int xmp_setxattr(const char *path, const char *name, const char *value,
+static int hp_setxattr(const char *path, const char *name, const char *value,
 			size_t size, int flags)
 {
 	int res = lsetxattr(path, name, value, size, flags);
@@ -414,7 +679,7 @@ static int xmp_setxattr(const char *path, const char *name, const char *value,
 	return 0;
 }
 
-static int xmp_getxattr(const char *path, const char *name, char *value,
+static int hp_getxattr(const char *path, const char *name, char *value,
 			size_t size)
 {
 	int res = lgetxattr(path, name, value, size);
@@ -423,7 +688,7 @@ static int xmp_getxattr(const char *path, const char *name, char *value,
 	return res;
 }
 
-static int xmp_listxattr(const char *path, char *list, size_t size)
+static int hp_listxattr(const char *path, char *list, size_t size)
 {
 	int res = llistxattr(path, list, size);
 	if (res == -1)
@@ -431,7 +696,7 @@ static int xmp_listxattr(const char *path, char *list, size_t size)
 	return res;
 }
 
-static int xmp_removexattr(const char *path, const char *name)
+static int hp_removexattr(const char *path, const char *name)
 {
 	int res = lremovexattr(path, name);
 	if (res == -1)
@@ -439,8 +704,9 @@ static int xmp_removexattr(const char *path, const char *name)
 	return 0;
 }
 #endif /* HAVE_SETXATTR */
+#endif
 
-static int xmp_lock(const char *path, struct fuse_file_info *fi, int cmd,
+static int hp_lock(const char *path, struct fuse_file_info *fi, int cmd,
 		    struct flock *lock)
 {
 	(void) path;
@@ -449,47 +715,63 @@ static int xmp_lock(const char *path, struct fuse_file_info *fi, int cmd,
 			   sizeof(fi->lock_owner));
 }
 
-static struct fuse_operations xmp_oper = {
-	.getattr	= xmp_getattr,
-	.fgetattr	= xmp_fgetattr,
-	.access		= xmp_access,
-	.readlink	= xmp_readlink,
-	.opendir	= xmp_opendir,
-	.readdir	= xmp_readdir,
-	.releasedir	= xmp_releasedir,
-	.mknod		= xmp_mknod,
-	.mkdir		= xmp_mkdir,
-	.symlink	= xmp_symlink,
-	.unlink		= xmp_unlink,
-	.rmdir		= xmp_rmdir,
-	.rename		= xmp_rename,
-	.link		= xmp_link,
-	.chmod		= xmp_chmod,
-	.chown		= xmp_chown,
-	.truncate	= xmp_truncate,
-	.ftruncate	= xmp_ftruncate,
-	.utimens	= xmp_utimens,
-	.create		= xmp_create,
-	.open		= xmp_open,
-	.read		= xmp_read,
-	.write		= xmp_write,
-	.statfs		= xmp_statfs,
-	.flush		= xmp_flush,
-	.release	= xmp_release,
-	.fsync		= xmp_fsync,
+static struct fuse_operations hp_oper = {
+	.getattr	= hp_getattr,
+	.fgetattr	= hp_fgetattr,
+	.access		= hp_access,
+	.readlink	= hp_readlink,
+	.opendir	= hp_opendir,
+	.readdir	= hp_readdir,
+	.releasedir	= hp_releasedir,
+	.init		= hp_init,
+	.destroy	= hp_destroy,
+	.mknod		= hp_mknod,
+	.mkdir		= hp_mkdir,
+	.symlink	= hp_symlink,
+	.unlink		= hp_unlink,
+	.rmdir		= hp_rmdir,
+	.rename		= hp_rename,
+	.link		= hp_link,
+	.chmod		= hp_chmod,
+	.chown		= hp_chown,
+	.truncate	= hp_truncate,
+	.ftruncate	= hp_ftruncate,
+	.utimens	= hp_utimens,
+	.create		= hp_create,
+	.open		= hp_open,
+	.read		= hp_read,
+	.write		= hp_write,
+	.statfs		= hp_statfs,
+	.flush		= hp_flush,
+	.release	= hp_release,
+	.fsync		= hp_fsync,
 #ifdef HAVE_SETXATTR
-	.setxattr	= xmp_setxattr,
-	.getxattr	= xmp_getxattr,
-	.listxattr	= xmp_listxattr,
-	.removexattr	= xmp_removexattr,
+	.setxattr	= hp_setxattr,
+	.getxattr	= hp_getxattr,
+	.listxattr	= hp_listxattr,
+	.removexattr	= hp_removexattr,
 #endif
-	.lock		= xmp_lock,
+	.lock		= hp_lock,
 
 	.flag_nullpath_ok = 1,
 };
 
 int main(int argc, char *argv[])
 {
+	struct passwd *passwd;
+	DIR *dir;
+
+	passwd = getpwuid(getuid());
+	if (!passwd)
+		return -errno;
+
+	dir = opendir(passwd->pw_dir);
+	if (!dir)
+		return -errno;
+	saved_home_fd = dirfd(dir);
+	if (saved_home_fd == -1)
+		return -errno;
+
 	umask(0);
-	return fuse_main(argc, argv, &xmp_oper, NULL);
+	return fuse_main(argc, argv, &hp_oper, NULL);
 }

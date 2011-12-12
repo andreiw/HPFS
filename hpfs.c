@@ -35,30 +35,31 @@
 #include <dirent.h>
 #include <sys/types.h>
 #include <pwd.h>
+#include <syslog.h>
+#include <fuse_opt.h>
 
 struct hp_priv {
 	int fd;
+	int redir_fd;
+} priv = {
+	-1,
+	-1
 };
-
-static int saved_home_fd = -1;
 
 static int hp_getattr(const char *path, struct stat *stbuf)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	res = fstatat(priv->fd,
-		      path, stbuf, AT_SYMLINK_NOFOLLOW);
+	res = fstatat(fd, path, stbuf, AT_SYMLINK_NOFOLLOW);
 	if (res == -1)
 		return -errno;
 
@@ -82,19 +83,17 @@ static int hp_fgetattr(const char *path, struct stat *stbuf,
 static int hp_access(const char *path, int mask)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	res = faccessat(priv->fd, path, mask, 0);
+	res = faccessat(fd, path, mask, 0);
 	if (res == -1)
 		return -errno;
 
@@ -104,19 +103,17 @@ static int hp_access(const char *path, int mask)
 static int hp_readlink(const char *path, char *buf, size_t size)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	res = readlinkat(priv->fd, path, buf, size - 1);
+	res = readlinkat(fd, path, buf, size - 1);
 	if (res == -1)
 		return -errno;
 
@@ -126,20 +123,21 @@ static int hp_readlink(const char *path, char *buf, size_t size)
 
 struct hp_dirp {
 	DIR *dp;
+	DIR *rdp;
 	struct dirent *entry;
 	off_t offset;
+#define ROOT_DIR  1
+#define REDIR_DIR 2
+	int flags;
 };
 
 static int hp_opendir(const char *path, struct fuse_file_info *fi)
 {
 	int res;
-	int fd;
+	int dup_fd;
+	int fd = priv.fd;
 	struct hp_dirp *d = malloc(sizeof(struct hp_dirp));
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	memset(d, 0, sizeof(*d));
 
 	if (d == NULL)
 		return -ENOMEM;
@@ -147,12 +145,32 @@ static int hp_opendir(const char *path, struct fuse_file_info *fi)
 	if (*path == '/')
 		path++;
 
-	if (!*path)
+	if (!*path) {
 		path = ".";
+		d->flags |= ROOT_DIR;
+
+		dup_fd = dup(priv.redir_fd);
+		if (dup_fd == -1) {
+			res = -errno;
+			free(d);
+			return res;
+		}
+		d->rdp = fdopendir(dup_fd);
+		if (!d->rdp) {
+			res = -errno;
+			close(dup_fd);
+			free(d);
+			return res;
+		}
+	} else if(*path == '.')
+		fd = priv.redir_fd;
 	
-	fd = openat(priv->fd, path, O_RDONLY | O_DIRECTORY);
+	fd = openat(fd, path, O_RDONLY | O_DIRECTORY);
 	if (fd == -1) {
+		syslog(LOG_ERR, "openat for %s failed\n", path);
 		res = -errno;
+		if (d->rdp)
+			closedir(d->rdp);
 		free(d);
 		return res;
 	}
@@ -160,6 +178,8 @@ static int hp_opendir(const char *path, struct fuse_file_info *fi)
 	d->dp = fdopendir(fd);
 	if (d->dp == NULL) {
 		res = -errno;
+		if (d->rdp)
+			closedir(d->rdp);
 		close(fd);
 		free(d);
 		return res;
@@ -180,27 +200,47 @@ static int hp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		       off_t offset, struct fuse_file_info *fi)
 {
 	struct hp_dirp *d = get_dirp(fi);
+	DIR *dp = d->dp;
 
 	(void) path;
 	if (offset != d->offset) {
-		seekdir(d->dp, offset);
+		if (d->offset != 0) {
+			syslog(LOG_ERR, "readdir() to non-consecutive offsets unsupported\n");
+			return -EINVAL;
+		}
+
+		seekdir(d->dp, 0);
 		d->entry = NULL;
-		d->offset = offset;
+		d->offset = 0;
 	}
 	while (1) {
 		struct stat st;
 		off_t nextoff;
 
 		if (!d->entry) {
-			d->entry = readdir(d->dp);
-			if (!d->entry)
-				break;
+			d->entry = readdir(dp);
+			if (!d->entry) {
+				if (!(d->flags & ROOT_DIR) ||
+					d->flags & REDIR_DIR)
+					break;
+
+				d->flags |= REDIR_DIR;
+				dp = d->rdp;
+				seekdir(dp, 0);
+				continue;
+			}
+		}
+
+		nextoff = telldir(dp);
+		if (d->flags == ROOT_DIR &&
+		    d->entry->d_name[0] == '.') {
+			d->entry = NULL;
+			continue;
 		}
 
 		memset(&st, 0, sizeof(st));
 		st.st_ino = d->entry->d_ino;
 		st.st_mode = d->entry->d_type << 12;
-		nextoff = telldir(d->dp);
 		if (filler(buf, d->entry->d_name, &st, nextoff))
 			break;
 
@@ -213,57 +253,33 @@ static int hp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
 static int hp_releasedir(const char *path, struct fuse_file_info *fi)
 {
-	int fd;
 	struct hp_dirp *d = get_dirp(fi);
 	(void) path;
 
-	fd = dirfd(d->dp);
 	closedir(d->dp);
-	close(fd);
+	if (d->rdp)
+		closedir(d->rdp);
 	free(d);
 	return 0;
-}
-
-static void *hp_init(struct fuse_conn_info *conn)
-{
-	struct hp_priv *priv;
-
-	priv = malloc(sizeof(*priv));
-	if (!priv)
-		return NULL;
-
-	priv->fd = saved_home_fd;
-	return priv;
-}
-
-static void hp_destroy(void *data)
-{
-	struct hp_priv *priv = data;
-	if (!priv)
-		return;
-
-	free(priv);
 }
 
 static int hp_mknod(const char *path, mode_t mode, dev_t rdev)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
 	if (S_ISFIFO(mode))
-		res = mkfifoat(priv->fd, path, mode);
+		res = mkfifoat(fd, path, mode);
 	else
-		res = mknodat(priv->fd, path, mode, rdev);
+		res = mknodat(fd, path, mode, rdev);
 	if (res == -1)
 		return -errno;
 
@@ -273,19 +289,17 @@ static int hp_mknod(const char *path, mode_t mode, dev_t rdev)
 static int hp_mkdir(const char *path, mode_t mode)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	res = mkdirat(priv->fd, path, mode);
+	res = mkdirat(fd, path, mode);
 	if (res == -1)
 		return -errno;
 
@@ -295,19 +309,17 @@ static int hp_mkdir(const char *path, mode_t mode)
 static int hp_unlink(const char *path)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	res = unlinkat(priv->fd, path, 0);
+	res = unlinkat(fd, path, 0);
 	if (res == -1)
 		return -errno;
 
@@ -317,19 +329,17 @@ static int hp_unlink(const char *path)
 static int hp_rmdir(const char *path)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	res = unlinkat(priv->fd, path, AT_REMOVEDIR);
+	res = unlinkat(fd, path, AT_REMOVEDIR);
 	if (res == -1)
 		return -errno;
 
@@ -339,25 +349,17 @@ static int hp_rmdir(const char *path)
 static int hp_symlink(const char *from, const char *to)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
-
-	if (*from == '/')
-		from++;
-
-	if (!*from)
-		from = ".";
+	int fd = priv.fd;
 
 	if (*to == '/')
 		to++;
 
 	if (!*to)
 		to = ".";
+	else if(*to == '.')
+		fd = priv.redir_fd;
 
-	res = symlinkat(from, priv->fd, to);
+	res = symlinkat(from, fd, to);
 	if (res == -1)
 		return -errno;
 
@@ -367,26 +369,27 @@ static int hp_symlink(const char *from, const char *to)
 static int hp_rename(const char *from, const char *to)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd_from = priv.fd;
+	int fd_to = priv.fd;
 
 	if (*from == '/')
 		from++;
 
 	if (!*from)
 		from = ".";
+	else if (*from == '.')
+		fd_from = priv.redir_fd;
 
 	if (*to == '/')
 		to++;
 
 	if (!*to)
 		to = ".";
+	else if (*to == '.')
+		fd_to = priv.redir_fd;
 
-	res = renameat(priv->fd, from,
-		       priv->fd, to);
+	res = renameat(fd_from, from,
+		       fd_to, to);
 	if (res == -1)
 		return -errno;
 
@@ -396,26 +399,27 @@ static int hp_rename(const char *from, const char *to)
 static int hp_link(const char *from, const char *to)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd_from = priv.fd;
+	int fd_to = priv.fd;
 
 	if (*from == '/')
 		from++;
 
 	if (!*from)
 		from = ".";
+	else if (*from == '.')
+		fd_from = priv.redir_fd;
 
 	if (*to == '/')
 		to++;
 
 	if (!*to)
 		to = ".";
+	else if (*to == '.')
+		fd_to = priv.redir_fd;
 
-	res = linkat(priv->fd, from,
-		     priv->fd, to, 0);
+	res = linkat(fd_from, from,
+		     fd_to, to, 0);
 	if (res == -1)
 		return -errno;
 
@@ -425,19 +429,17 @@ static int hp_link(const char *from, const char *to)
 static int hp_chmod(const char *path, mode_t mode)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	res = fchmodat(priv->fd, path, mode, 0);
+	res = fchmodat(fd, path, mode, 0);
 	if (res == -1)
 		return -errno;
 
@@ -447,19 +449,17 @@ static int hp_chmod(const char *path, mode_t mode)
 static int hp_chown(const char *path, uid_t uid, gid_t gid)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	res = fchownat(priv->fd, path, uid, gid, AT_SYMLINK_NOFOLLOW);
+	res = fchownat(fd, path, uid, gid, AT_SYMLINK_NOFOLLOW);
 	if (res == -1)
 		return -errno;
 
@@ -469,21 +469,17 @@ static int hp_chown(const char *path, uid_t uid, gid_t gid)
 static int hp_truncate(const char *path, off_t size)
 {
 	int res;
-	int fd;
-
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	fd = openat(priv->fd, path, O_WRONLY);
+	fd = openat(fd, path, O_WRONLY);
 	if (fd == -1)
 		return -errno;
 
@@ -515,19 +511,17 @@ static int hp_ftruncate(const char *path, off_t size,
 static int hp_utimens(const char *path, const struct timespec ts[2])
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	res = utimensat(priv->fd, path, ts, 0);
+	res = utimensat(fd, path, ts, 0);
 	if (res == -1)
 		return -errno;
 
@@ -536,20 +530,17 @@ static int hp_utimens(const char *path, const struct timespec ts[2])
 
 static int hp_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
-	int fd;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	fd = openat(priv->fd, path, fi->flags, mode);
+	fd = openat(fd, path, fi->flags, mode);
 	if (fd == -1)
 		return -errno;
 
@@ -559,20 +550,17 @@ static int hp_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 
 static int hp_open(const char *path, struct fuse_file_info *fi)
 {
-	int fd;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
-
-	if (!priv)
-		return -ENXIO;
+	int fd = priv.fd;
 
 	if (*path == '/')
 		path++;
 
 	if (!*path)
 		path = ".";
+	else if(*path == '.')
+		fd = priv.redir_fd;
 
-	fd = openat(priv->fd, path, fi->flags);
+	fd = openat(fd, path, fi->flags);
 	if (fd == -1)
 		return -errno;
 
@@ -609,13 +597,8 @@ static int hp_write(const char *path, const char *buf, size_t size,
 static int hp_statfs(const char *path, struct statvfs *stbuf)
 {
 	int res;
-	struct fuse_context *context = fuse_get_context();
-	struct hp_priv *priv = context->private_data;
 
-	if (!priv)
-		return -ENXIO;
-
-	res = fstatvfs(priv->fd, stbuf);
+	res = fstatvfs(priv.fd, stbuf);
 	if (res == -1)
 		return -errno;
 
@@ -723,8 +706,6 @@ static struct fuse_operations hp_oper = {
 	.opendir	= hp_opendir,
 	.readdir	= hp_readdir,
 	.releasedir	= hp_releasedir,
-	.init		= hp_init,
-	.destroy	= hp_destroy,
 	.mknod		= hp_mknod,
 	.mkdir		= hp_mkdir,
 	.symlink	= hp_symlink,
@@ -758,20 +739,62 @@ static struct fuse_operations hp_oper = {
 
 int main(int argc, char *argv[])
 {
-	struct passwd *passwd;
 	DIR *dir;
+	int i, res;
+	char *error;
+	struct passwd *passwd;
+	struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
+
+	for(i = 0; i < argc; i++) {
+		if (i == 2) {
+			dir = opendir(argv[i]);
+			if (!dir) {
+				res = -errno;
+				error = "dot redirect path invalid";
+				goto err;
+			}
+			priv.redir_fd = dirfd(dir);
+			if (priv.redir_fd == -1) {
+				res = -errno;
+			        error = "couldn't get fd for dot redirect path";
+				goto err;
+			}
+		} else
+			fuse_opt_add_arg(&args, argv[i]);
+	}
+
+	if (priv.redir_fd == -1) {
+		error = "dot redirect path not passed";
+		res = EINVAL;
+		goto err;
+	}
 
 	passwd = getpwuid(getuid());
-	if (!passwd)
-		return -errno;
+	if (!passwd) {
+		res = -errno;
+		error = "you don't exist, go away";
+		goto err;
+	}
 
 	dir = opendir(passwd->pw_dir);
-	if (!dir)
-		return -errno;
-	saved_home_fd = dirfd(dir);
-	if (saved_home_fd == -1)
-		return -errno;
+	if (!dir) {
+		res = -errno;
+		error = "you don't have a home directory";
+		goto err;
+	}
+	priv.fd = dirfd(dir);
+	if (priv.fd == -1) {
+		res = -errno;
+		error = "couldn't get fd for home directory";
+		goto err;
+	}
+
+	openlog(argv[0], 0, LOG_USER);
 
 	umask(0);
-	return fuse_main(argc, argv, &hp_oper, NULL);
+	return fuse_main(args.argc, args.argv, &hp_oper, NULL);
+err:
+	fprintf(stderr, "%s: %d\n", error, res);
+	syslog(LOG_ERR, "%s: %d\n", error, res);
+	return res;
 }

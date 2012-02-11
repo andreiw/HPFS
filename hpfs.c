@@ -653,7 +653,7 @@ static int hp_fsync(const char *path, int isdatasync,
 #if 0
 
 /*
- * No *at() variants available, so not implementable, yet.
+ * To be done.
  */
 
 #ifdef HAVE_SETXATTR

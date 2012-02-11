@@ -7,7 +7,7 @@
 
   gcc -Wall `pkg-config fuse --cflags --libs` -lulockmgr hpfs.c -o hpfs
 
-  Using: ./hpfs -o allow_root ~/ -o nonempty
+  Using: ./hpfs ~/ $redir -o nonempty,allow_root
 */
 
 #define FUSE_USE_VERSION 26

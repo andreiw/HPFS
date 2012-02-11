@@ -1,0 +1,27 @@
+Host Profile File System
+========================
+
+This is a solution for concurrent logins with network
+mounted home directory.
+
+Example: Logging in concurrently to an RHEL5 and a SLES11 box
+will result in a corrupted GNOME profile. To avoid deadlock, mysterious
+failures and configuration conflicts, dotfile accesses are redirected
+to system specific locations.
+
+HPFS is a FUSE-based solution and is a filter file system that is mounted
+over the user's home directory. The daemon itself is "dumb" and has no
+policy. The redirection target directory is derived by the support
+scripts. You get two scripts here -
+* .bash_profile
+* .xprofile
+
+These two should be sufficient both for console and XDM/GDM/KDM logins.
+These two scripts redirect to $HOME/profiles/$HOSTNAME.
+
+A paper will be available soon.
+
+Contact Info
+============
+
+Andrei Warkentin (andrey.warkentin@gmail.com, andreiw@vmware.com, andreiw@msalumni.com)
